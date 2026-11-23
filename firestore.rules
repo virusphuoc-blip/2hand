@@ -1,0 +1,200 @@
+rules_version = '2';
+
+// 2Hand — Firestore Security Rules (v1.0.0)
+// Chủ sở hữu duyệt rồi tự đăng tại Firebase Console → Firestore Database → Rules.
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ---------- Helpers ----------
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    // Admin: chỉ tài khoản Google virusphuoc@gmail.com (email đã xác minh).
+    function isAdmin() {
+      return signedIn()
+        && request.auth.token.email == 'virusphuoc@gmail.com'
+        && request.auth.token.email_verified == true
+        && request.auth.token.firebase.sign_in_provider == 'google.com';
+    }
+
+    function userDoc() {
+      return /databases/$(database)/documents/users/$(request.auth.uid);
+    }
+
+    // Người bán hợp lệ: đã có hồ sơ và không bị khoá.
+    function activeSeller() {
+      return signedIn() && exists(userDoc()) && get(userDoc()).data.disabled != true;
+    }
+
+    function nowMs() {
+      return request.time.toMillis();
+    }
+
+    function isPhone(s) {
+      return s is string && s.matches('^(0|84)[0-9]{9,10}$');
+    }
+
+    function changed() {
+      return request.resource.data.diff(resource.data).affectedKeys();
+    }
+
+    // ---------- Users (hồ sơ người bán) ----------
+    function validProfile(d) {
+      return d.keys().hasOnly(['email', 'displayName', 'phone', 'zalo', 'province', 'disabled', 'createdAt'])
+        && d.keys().hasAll(['email', 'displayName', 'phone', 'zalo', 'province', 'disabled', 'createdAt'])
+        && d.email is string && d.email.size() <= 200
+        && d.displayName is string && d.displayName.size() >= 2 && d.displayName.size() <= 60
+        && isPhone(d.phone)
+        && (d.zalo == '' || isPhone(d.zalo))
+        && d.province is string && d.province.size() >= 2 && d.province.size() <= 60
+        && d.disabled is bool
+        && d.createdAt is int;
+    }
+
+    match /users/{uid} {
+      allow read: if (signedIn() && request.auth.uid == uid) || isAdmin();
+      allow create: if signedIn() && request.auth.uid == uid
+        && validProfile(request.resource.data)
+        && request.resource.data.disabled == false
+        && request.resource.data.email == request.auth.token.email
+        && request.resource.data.createdAt > nowMs() - 3600000
+        && request.resource.data.createdAt < nowMs() + 3600000;
+      allow update: if signedIn() && request.auth.uid == uid
+        && validProfile(request.resource.data)
+        && changed().hasOnly(['displayName', 'phone', 'zalo', 'province']);
+      // Admin chỉ khoá / mở khoá.
+      allow update: if isAdmin()
+        && validProfile(request.resource.data)
+        && changed().hasOnly(['disabled']);
+      allow delete: if isAdmin();
+    }
+
+    // ---------- Categories (checklist danh mục) ----------
+    match /categories/{catId} {
+      allow read: if true;
+      allow write: if isAdmin()
+        && catId.matches('^[a-z0-9-]{1,60}$')
+        && request.resource.data.keys().hasOnly(['name', 'order', 'active'])
+        && request.resource.data.name is string
+        && request.resource.data.name.size() >= 2 && request.resource.data.name.size() <= 60
+        && request.resource.data.order is int
+        && request.resource.data.active is bool;
+      allow delete: if isAdmin();
+    }
+
+    // ---------- Listings (tin đăng) ----------
+    function validListing(d) {
+      return d.keys().hasOnly(['title', 'categoryId', 'categoryName', 'condition', 'price', 'description',
+          'thumb', 'imageCount', 'province', 'phone', 'zalo', 'sellerId', 'sellerName', 'status',
+          'createdAt', 'updatedAt'])
+        && d.keys().hasAll(['title', 'categoryId', 'categoryName', 'condition', 'price', 'description',
+          'thumb', 'imageCount', 'province', 'phone', 'zalo', 'sellerId', 'sellerName', 'status',
+          'createdAt', 'updatedAt'])
+        && d.title is string && d.title.size() >= 5 && d.title.size() <= 100
+        && d.categoryId is string && d.categoryId.matches('^[a-z0-9-]{1,60}$')
+        && d.categoryName is string && d.categoryName.size() <= 60
+        && d.condition in ['new', 'like-new', 'used-good', 'used-scratched']
+        && d.price is int && d.price >= 0 && d.price <= 10000000000
+        && d.description is string && d.description.size() >= 10 && d.description.size() <= 3000
+        && d.thumb is string && d.thumb.size() <= 30000
+        && d.imageCount is int && d.imageCount >= 0 && d.imageCount <= 4
+        && d.province is string && d.province.size() >= 2 && d.province.size() <= 60
+        && isPhone(d.phone)
+        && (d.zalo == '' || isPhone(d.zalo))
+        && d.sellerName is string && d.sellerName.size() >= 1 && d.sellerName.size() <= 60
+        && d.status in ['pending', 'active', 'sold', 'hidden']
+        && d.createdAt is int && d.createdAt < nowMs() + 3600000
+        && d.updatedAt is int && d.updatedAt < nowMs() + 3600000;
+    }
+
+    match /listings/{id} {
+      // Ai cũng xem được tin đang bán / đã bán; người bán & admin xem được mọi tin của mình.
+      allow read: if resource.data.status in ['active', 'sold']
+        || (signedIn() && resource.data.sellerId == request.auth.uid)
+        || isAdmin();
+
+      // Đăng tin mới: luôn ở trạng thái chờ duyệt.
+      allow create: if activeSeller()
+        && validListing(request.resource.data)
+        && request.resource.data.sellerId == request.auth.uid
+        && request.resource.data.status == 'pending'
+        && request.resource.data.createdAt > nowMs() - 3600000;
+
+      // Người bán: sửa tin / đăng lại (về "chờ duyệt") hoặc đánh dấu "đã bán".
+      allow update: if activeSeller()
+        && resource.data.sellerId == request.auth.uid
+        && request.resource.data.sellerId == request.auth.uid
+        && validListing(request.resource.data)
+        && (
+          (request.resource.data.status == 'pending'
+            && (request.resource.data.createdAt == resource.data.createdAt
+                || request.resource.data.createdAt > nowMs() - 3600000))
+          || (resource.data.status == 'active'
+            && request.resource.data.status == 'sold'
+            && changed().hasOnly(['status', 'updatedAt']))
+        );
+
+      // Admin: duyệt / ẩn (chỉ đổi trạng thái).
+      allow update: if isAdmin()
+        && validListing(request.resource.data)
+        && changed().hasOnly(['status', 'updatedAt']);
+
+      allow delete: if (signedIn() && resource.data.sellerId == request.auth.uid) || isAdmin();
+    }
+
+    // ---------- Ảnh tin đăng (base64 nhỏ hoặc link https) ----------
+    function validImage(s) {
+      return s is string && s.size() <= 200000
+        && (s.matches('^data:image/(jpeg|png|webp);base64,.*') || s.matches('^https://.*'));
+    }
+
+    function validImages(list) {
+      return list is list && list.size() >= 0 && list.size() <= 4
+        && (list.size() < 1 || validImage(list[0]))
+        && (list.size() < 2 || validImage(list[1]))
+        && (list.size() < 3 || validImage(list[2]))
+        && (list.size() < 4 || validImage(list[3]));
+    }
+
+    function listingPath(id) {
+      return /databases/$(database)/documents/listings/$(id);
+    }
+
+    match /listingImages/{id} {
+      allow read: if (signedIn() && resource.data.sellerId == request.auth.uid)
+        || isAdmin()
+        || (exists(listingPath(id)) && get(listingPath(id)).data.status in ['active', 'sold']);
+      allow create: if activeSeller()
+        && request.resource.data.keys().hasOnly(['sellerId', 'images'])
+        && request.resource.data.sellerId == request.auth.uid
+        && validImages(request.resource.data.images)
+        && getAfter(listingPath(id)).data.sellerId == request.auth.uid;
+      allow update: if activeSeller()
+        && resource.data.sellerId == request.auth.uid
+        && request.resource.data.keys().hasOnly(['sellerId', 'images'])
+        && request.resource.data.sellerId == request.auth.uid
+        && validImages(request.resource.data.images);
+      allow delete: if (signedIn() && resource.data.sellerId == request.auth.uid) || isAdmin();
+    }
+
+    // ---------- Báo cáo tin đăng ----------
+    match /reports/{id} {
+      allow create: if signedIn()
+        && request.resource.data.keys().hasOnly(['listingId', 'listingTitle', 'reason', 'note',
+            'reporterId', 'reporterEmail', 'status', 'createdAt'])
+        && request.resource.data.reporterId == request.auth.uid
+        && request.resource.data.listingId is string && request.resource.data.listingId.size() <= 100
+        && request.resource.data.listingTitle is string && request.resource.data.listingTitle.size() <= 100
+        && request.resource.data.reason in ['scam', 'wrong-description', 'sold', 'duplicate', 'prohibited', 'other']
+        && request.resource.data.note is string && request.resource.data.note.size() <= 500
+        && request.resource.data.reporterEmail is string && request.resource.data.reporterEmail.size() <= 200
+        && request.resource.data.status == 'open'
+        && request.resource.data.createdAt is int;
+      allow read, delete: if isAdmin();
+      allow update: if isAdmin()
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status'])
+        && request.resource.data.status in ['open', 'resolved'];
+    }
+  }
+}
